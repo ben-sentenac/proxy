@@ -1,157 +1,138 @@
-import https from 'node:https';
 import http from 'node:http';
-import net from 'node:net'
+import https from 'node:https';
+import net from 'node:net';
+import fs from 'node:fs';
 import { URL } from 'node:url';
-import { pipeline } from 'node:stream/promises';
-import { readFileSync } from 'node:fs';
 
-/**
- * Étape 1 : Construire le proxy HTTP
-    Le proxy  doit :
-    - Intercepter les requêtes entrantes.
-    - Les transmettre au serveur cible.
-    - Intercepter les réponses et les renvoyer au client.
+// Paths to certificate and key for HTTPS interception
+const CERT_PATH = './cert.pem';
+const KEY_PATH = './key.pem';
 
-    openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes
-*/
+if (!fs.existsSync(CERT_PATH) || !fs.existsSync(KEY_PATH)) {
+    console.error('Certificat ou clé introuvable ! Assurez-vous que les fichiers sont générés.');
+    process.exit(1);
+}
 
-const key = readFileSync('./key.pem');
-const cert = readFileSync('./cert.pem');
+const privateKey = fs.readFileSync(KEY_PATH, 'utf8');
+const certificate = fs.readFileSync(CERT_PATH, 'utf8');
 
-const httpsServers = new Set();
+// Global store for dynamically created HTTPS servers
+const httpsServers = new Map();
 
-const proxyServer = http.createServer(async (clientRequest, clientResponse) => {
-    const targetUrl = new URL(clientRequest.url);
+// HTTP Proxy Server
+const httpProxy = http.createServer((req, res) => {
+    console.log(`[HTTP] Requête interceptée : ${req.method} ${req.url}`);
+
+    const parsedUrl = new URL(req.url);
     const options = {
-        hostname: clientRequest.headers['host'].split(':')[0],
-        port: targetUrl.port ?? 80,
-        path: targetUrl.pathname,
-        method: clientRequest.method,
-        headers: clientRequest.headers
+        hostname: parsedUrl.hostname,
+        port: parsedUrl.port || 80,
+        path: parsedUrl.path,
+        method: req.method,
+        headers: req.headers,
     };
 
-    //client -----> proxy-----> server
-    //forward request 
-    const serverRequest = http.request(options, async (serverResponse) => {
-        clientResponse.writeHead(serverResponse.statusCode, serverResponse.headers);
-        //redirect client
-        await pipeline(
-            serverResponse,
-            clientResponse
-        );
+    const proxyReq = http.request(options, (proxyRes) => {
+        res.writeHead(proxyRes.statusCode, proxyRes.headers);
+        proxyRes.pipe(res);
     });
 
-    //get to server 
-    await pipeline(
-        clientRequest,
-        serverRequest
-    );
+    req.pipe(proxyReq);
 
-    serverRequest.on('error', (err) => {
-        console.error('[HTTP Error]', err);
-        clientResponse.writeHead(500);
-        clientResponse.end('Proxy Error');
+    proxyReq.on('error', (err) => {
+        console.error('[HTTP Proxy Error]', err.message);
+        res.writeHead(500);
+        res.end('Erreur dans le proxy HTTP.');
     });
-
 });
 
+// HTTPS CONNECT Handler
+httpProxy.on('connect', (req, clientSocket, head) => {
+    const [hostname, port] = req.url.split(':');
+    console.log(`[HTTPS] Tunnel intercepté : ${hostname}:${port}`);
 
-//handle https 
+    // Create or reuse an HTTPS server for the hostname
+    let httpsServer = httpsServers.get(hostname);
+    if (!httpsServer) {
+        httpsServer = https.createServer({
+            key: privateKey,
+            cert: certificate,
+        }, (req, res) => {
+            console.log(`[HTTPS] Requête interceptée : ${req.method} ${req.url}`);
 
-proxyServer.on('connect', (request, clientSocket, head) => {
-    const [hostname, port] = request.url.split(':');
-    console.log(`[HTTPS] Tunnel vers ${hostname}:${port}`);
-    //start temporary https server
-    const httpsServer = https.createServer({
-        key,
-        cert
-    },
-        async (httpsRequest, httpsResponse) => {
-            console.log(`[HTTPS] Requête interceptée : ${httpsRequest.url}`);
-
+            const parsedUrl = new URL(req.url);
             const options = {
-                hostname: httpsRequest.headers.host.split(':')[0],
-                port: 443,
-                path: httpsRequest.url,
-                method: httpsRequest.method,
-                headers: httpsRequest.headers,
+                hostname: parsedUrl.hostname,
+                port: parsedUrl.port || 443,
+                path: parsedUrl.path,
+                method: req.method,
+                headers: req.headers,
             };
 
-            const proxyRequest = https.request(options,async (proxyResponse) => {
-                httpsResponse.writeHead(proxyResponse.statusCode, proxyResponse.headers);
-                await pipeline(
-                    proxyResponse,
-                    httpsResponse
-                );
+            const proxyReq = https.request(options, (proxyRes) => {
+                res.writeHead(proxyRes.statusCode, proxyRes.headers);
+                proxyRes.pipe(res);
             });
 
-            await pipeline(
-                httpsRequest,
-                proxyRequest
-            );
-        });
+            req.pipe(proxyReq);
 
-    httpsServer.listen(0, () => {
-        const { port } = httpsServer.address();
-        clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
-
-        httpsServers.add(httpsServer);
-
-        const tunnel = net.connect(port, 'localhost', () => {
-            console.log('connectiong on port',port);
-            clientSocket.pipe(tunnel);
-            tunnel.pipe(clientSocket);
-        });
-
-        tunnel.on('error', (err) => {
-            console.error('[Tunnel Error]', err);
-            clientSocket.end();
-            httpsServer.close(() => {
-                httpsServers.delete(httpsServer);
+            proxyReq.on('error', (err) => {
+                console.error('[HTTPS Proxy Error]', err.message);
+                res.writeHead(500);
+                res.end('Erreur dans le proxy HTTPS.');
             });
         });
 
-        clientSocket.on('end', () => console.log(`[HTTPS] Connexion terminée : ${hostname}:${port}`))
+        httpsServer.listen(0, () => {
+            console.log(`[HTTPS] Serveur HTTPS prêt pour ${hostname} sur le port ${httpsServer.address().port}`);
+            httpsServers.set(hostname, httpsServer);
 
-        clientSocket.on('close', () => {
-            //close opened https connection
-            httpsServer.close((err) => {
-                if(err) console.error(err);
-                console.log(`closing: ${hostname}:${port}`);
-                httpsServers.delete(httpsServer);
-            })
+            // Immediately handle queued requests after server starts
+            handleHttpsConnection(httpsServer, clientSocket);
         });
 
-        tunnel.setTimeout(10000, () => {
-            console.error('[Tunnel Error] Timeout');
-            tunnel.destroy();
-            httpsServer.close(() => httpsServers.delete(httpsServer));
-          });
-      
-          clientSocket.setTimeout(10000, () => {
-            console.error('[Client Error] Timeout');
-            clientSocket.destroy();
-            httpsServer.close(() => httpsServers.delete(httpsServer));
-          });
+        httpsServer.on('close', () => {
+            httpsServers.delete(hostname);
+        });
+
+        httpsServer.on('error', (err) => {
+            console.error(`[HTTPS Server Error for ${hostname}]`, err.message);
+        });
+    } else {
+        // Handle connection if server already exists
+        handleHttpsConnection(httpsServer, clientSocket);
+    }
+});
+
+function handleHttpsConnection(httpsServer, clientSocket) {
+    const targetPort = httpsServer.address().port;
+    clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+
+    const tunnel = net.connect(targetPort, 'localhost', () => {
+        clientSocket.pipe(tunnel);
+        tunnel.pipe(clientSocket);
     });
 
-    httpsServer.on('error', (err) => {
-        console.error('[HTTPS Server Error]', err);
+    tunnel.on('error', (err) => {
+        console.error('[Tunnel Error]', err.message);
         clientSocket.end();
     });
-});
 
+    clientSocket.on('end', () => {
+        console.log(`[HTTPS] Tunnel fermé.`);
+    });
+}
 
-// Clean up on exit
+// Graceful Shutdown
 process.on('SIGINT', () => {
     console.log('\nArrêt du proxy...');
-    for (const server of httpsServers) {
-      server.close(() => httpsServers.delete(server));
+    for (const [hostname, server] of httpsServers) {
+        server.close();
     }
     process.exit();
-  });
-
-proxyServer.listen(8080, '127.0.0.1', () => {
-    console.log('server is listening on ', proxyServer.address());
 });
 
+// Start Proxy
+httpProxy.listen(8080, () => {
+    console.log('Proxy de sécurité en écoute:',httpProxy.address());
+});
